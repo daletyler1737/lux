@@ -19,17 +19,18 @@ defmodule Lux.LLM.OpenRouter do
 
   defmodule Config do
     @moduledoc """
-    Configuration module for OpenRouter.
+    Configuration for OpenRouter provider.
     """
     @type t :: %__MODULE__{
             endpoint: String.t(),
             model: String.t(),
-            api_key: String.t(),
+            api_key: String.t() | nil,
             temperature: float(),
             max_tokens: integer() | nil,
             tools: boolean(),
-            tool_choice: atom() | String.t() | nil,
+            tool_choice: :auto | :none | String.t() | nil,
             stream: boolean(),
+            json_mode: boolean(),
             site_url: String.t() | nil,
             site_name: String.t() | nil,
             route: String.t() | nil,
@@ -45,6 +46,7 @@ defmodule Lux.LLM.OpenRouter do
               tools: true,
               tool_choice: :auto,
               stream: false,
+              json_mode: false,
               site_url: nil,
               site_name: nil,
               route: nil,
@@ -53,52 +55,40 @@ defmodule Lux.LLM.OpenRouter do
   end
 
   @impl true
-  def call(prompt, tools, config) do
-    cfg =
-      struct(
-        Config,
-        Map.merge(
-          %{
-            model: Application.get_env(:lux, :open_router_models)[:default],
-            api_key: Application.get_env(:lux, :api_keys)[:openrouter]
-          },
-          config
-        )
-      )
+  @spec call(binary(), [module()], Config.t() | map()) ::
+          {:ok, ResponseSignal.t()} | {:error, term()}
+  def call(prompt, tools, config \\ %{}) do
+    cfg = build_config(config)
 
     messages = cfg.messages ++ build_messages(prompt)
     tools_config = if cfg.tools, do: build_tools_config(tools), else: []
 
     body =
       %{
-        model: Lux.Config.resolve(cfg.model),
+        model: cfg.model,
         messages: messages,
         temperature: cfg.temperature
       }
-      |> maybe_add_max_tokens(cfg.max_tokens)
+      |> maybe_add(:max_tokens, cfg.max_tokens)
       |> maybe_add_tools(tools_config, cfg.tool_choice)
-      |> maybe_add_stream(cfg.stream)
+      |> maybe_add(:stream, cfg.stream)
+      |> maybe_add_json_mode(cfg.json_mode)
 
     headers =
       [
-        {"Authorization", "Bearer #{Lux.Config.resolve(cfg.api_key)}"},
-        {"Content-Type", "application/json"}
+        {"Authorization", "Bearer #{cfg.api_key}"},
+        {"Content-Type", "application/json"},
+        {"HTTP-Referer", cfg.site_url},
+        {"X-OpenRouter-Title", cfg.site_name},
+        {"X-OpenRouter-Route", cfg.route}
       ]
-      |> maybe_add_header("HTTP-Referer", cfg.site_url)
-      |> maybe_add_header("X-OpenRouter-Title", cfg.site_name)
-      |> maybe_add_header("X-OpenRouter-Route", cfg.route)
+      |> Enum.reject(fn {_, v} -> is_nil(v) or v == "" end)
 
-    [
-      url: @endpoint,
-      json: body,
-      headers: headers
-    ]
-    |> Keyword.merge(Application.get_env(:lux, __MODULE__, []))
-    |> Req.new()
-    |> Req.post()
-    |> case do
+    request = Req.new(url: @endpoint, json: body, headers: headers)
+
+    case perform_request(request, cfg) do
       {:ok, %{status: 200} = response} ->
-        handle_response(response, cfg)
+        handle_response(response)
 
       {:ok, %{status: 401}} ->
         {:error, :invalid_api_key}
@@ -113,12 +103,46 @@ defmodule Lux.LLM.OpenRouter do
         {:error, {status, msg}}
 
       {:error, error} ->
-        handle_error(error, cfg)
+        {:error, error}
     end
   end
 
+  defp build_config(config) do
+    defaults = %{
+      model: default_model(),
+      api_key: default_api_key()
+    }
+
+    struct(Config, Map.merge(defaults, config))
+  end
+
+  defp default_model do
+    Application.get_env(:lux, :open_router_models, [])
+    |> Keyword.get(:default, @default_model)
+  end
+
+  defp default_api_key do
+    Application.get_env(:lux, :api_keys, [])
+    |> Keyword.get(:openrouter, System.get_env("OPENROUTER_API_KEY", ""))
+  end
+
+  defp perform_request(request, %{retries: retries}) when retries > 0 do
+    case Req.post(request) do
+      {:ok, %{status: status}} when status in [429, 500, 502, 503, 504] ->
+        Logger.warning("OpenRouter request failed (status #{status}), retrying...")
+        perform_request(request, %{retries: retries - 1})
+
+      result ->
+        result
+    end
+  end
+
+  defp perform_request(request, _cfg) do
+    Req.post(request)
+  end
+
   @doc """
-  Register OpenRouter as a provider in the Lux.LLM.ProviderRegistry.
+  Register OpenRouter as a provider in Lux.LLM.ProviderRegistry.
 
   ## Examples
 
@@ -127,7 +151,7 @@ defmodule Lux.LLM.OpenRouter do
   """
   @spec register() :: :ok | {:error, term()}
   def register do
-    :ok = Lux.LLM.ProviderRegistry.register(:openrouter, %{
+    registry().register(:openrouter, %{
       module: __MODULE__,
       models: [
         "anthropic/claude-3.5-sonnet",
@@ -152,15 +176,11 @@ defmodule Lux.LLM.OpenRouter do
     })
   end
 
-  defp build_messages(prompt) do
-    [%{role: "user", content: prompt}]
-  end
+  # Private helpers
 
-  defp build_tools_config([]), do: []
-  defp build_tools_config(tools), do: Enum.map(tools, &tool_to_function/1)
-
-  defp maybe_add_max_tokens(body, nil), do: body
-  defp maybe_add_max_tokens(body, max_tokens), do: Map.put(body, :max_tokens, max_tokens)
+  defp maybe_add(map, _key, nil), do: map
+  defp maybe_add(map, _key, ""), do: map
+  defp maybe_add(map, key, value), do: Map.put(map, key, value)
 
   defp maybe_add_tools(body, [], _choice), do: body
   defp maybe_add_tools(body, tools, choice) do
@@ -169,39 +189,32 @@ defmodule Lux.LLM.OpenRouter do
     |> Map.put(:tool_choice, format_tool_choice(choice))
   end
 
-  defp maybe_add_stream(body, false), do: body
-  defp maybe_add_stream(body, true), do: Map.put(body, :stream, true)
+  defp maybe_add_json_mode(body, true) do
+    Map.put(body, :response_format, %{"type" => "json_object"})
+  end
+
+  defp maybe_add_json_mode(body, false), do: body
 
   defp format_tool_choice(:none), do: "none"
   defp format_tool_choice(:auto), do: "auto"
-  defp format_tool_choice(name) when is_binary(name) do
-    %{"type" => "function", "function" => %{"name" => String.replace(name, ".", "_")}}
-  end
+  defp format_tool_choice(name) when is_binary(name), do: name
   defp format_tool_choice(_), do: "auto"
 
-  defp maybe_add_header(headers, _key, nil), do: headers
-  defp maybe_add_header(headers, _key, ""), do: headers
-  defp maybe_add_header(headers, key, value), do: headers ++ [{key, value}]
+  defp build_messages(prompt), do: [%{role: "user", content: prompt}]
+
+  defp build_tools_config([]), do: []
+  defp build_tools_config(tools), do: Enum.map(tools, &tool_to_function/1)
 
   defp tool_to_function({:python, path}) do
-    path
-    |> Prism.view()
-    |> tool_to_function()
+    path |> Prism.view() |> tool_to_function()
   end
 
   def tool_to_function(tool_module) when is_atom(tool_module) and not is_nil(tool_module) do
     cond do
-      Lux.prism?(tool_module) ->
-        tool_to_function(tool_module.view())
-
-      Lux.beam?(tool_module) ->
-        tool_to_function(tool_module.view())
-
-      Lux.lens?(tool_module) ->
-        tool_to_function(tool_module.view())
-
-      true ->
-        raise "Unsupported tool type: #{inspect(tool_module)}"
+      Lux.prism?(tool_module) -> tool_to_function(tool_module.view())
+      Lux.beam?(tool_module) -> tool_to_function(tool_module.view())
+      Lux.lens?(tool_module) -> tool_to_function(tool_module.view())
+      true -> raise "Unsupported tool type: #{inspect(tool_module)}"
     end
   end
 
@@ -211,7 +224,7 @@ defmodule Lux.LLM.OpenRouter do
       function: %{
         name: String.replace(name, ".", "_"),
         description: desc || "",
-        parameters: schema
+        parameters: schema || %{"type" => "object", "properties" => %{}}
       }
     }
   end
@@ -222,7 +235,7 @@ defmodule Lux.LLM.OpenRouter do
       function: %{
         name: String.replace(name, ".", "_"),
         description: desc || "",
-        parameters: schema
+        parameters: schema || %{"type" => "object", "properties" => %{}}
       }
     }
   end
@@ -233,12 +246,12 @@ defmodule Lux.LLM.OpenRouter do
       function: %{
         name: name || "unnamed_lens",
         description: desc || "",
-        parameters: schema
+        parameters: schema || %{"type" => "object", "properties" => %{}}
       }
     }
   end
 
-  defp handle_response(%{body: body}, _cfg) do
+  defp handle_response(%{body: body}) do
     with %{"choices" => [choice | _]} <- body,
          %{"message" => message} <- choice,
          {:ok, content} <- parse_content(message["content"]),
@@ -265,73 +278,80 @@ defmodule Lux.LLM.OpenRouter do
       }
       |> Lux.Signal.new()
       |> ResponseSignal.validate()
+    else
+      nil -> {:error, :invalid_response}
+      %{} -> {:error, :invalid_response}
+      {:error, _} = error -> error
     end
   end
 
-  def parse_content(content) when is_binary(content) do
+  defp parse_content(content) when is_binary(content) do
     case Jason.decode(content) do
-      {:ok, structured_output} -> {:ok, structured_output}
+      {:ok, parsed} -> {:ok, parsed}
       {:error, _} -> {:ok, content}
     end
   end
 
-  def parse_content(nil), do: {:ok, nil}
-  def parse_content(other), do: {:ok, other}
+  defp parse_content(nil), do: {:ok, nil}
+  defp parse_content(other), do: {:ok, other}
 
-  def execute_tool_calls(nil), do: {:ok, nil}
+  defp execute_tool_calls(nil), do: {:ok, []}
 
-  def execute_tool_calls(tool_calls) when is_list(tool_calls) do
-    tool_calls
-    |> Enum.map(&execute_tool_call/1)
-    |> Enum.reduce({:ok, []}, fn
-      {:ok, result, _log}, {:ok, results} -> {:ok, [result | results]}
-      {:ok, result}, {:ok, results} -> {:ok, [result | results]}
-      error, _ -> error
-    end)
+  defp execute_tool_calls(tool_calls) when is_list(tool_calls) do
+    results =
+      tool_calls
+      |> Enum.map(fn call ->
+        Task.async(fn -> execute_tool_call(call) end)
+      end)
+      |> Task.await_many(timeout: 30_000)
+
+    errors = Enum.filter(results, &match?({:error, _}, &1))
+
+    if Enum.empty?(errors) do
+      {:ok, results}
+    else
+      {:error, errors}
+    end
   end
 
-  def execute_tool_call(%{"function" => %{"name" => tool_name, "arguments" => args}}) do
+  defp execute_tool_call(%{"function" => %{"name" => tool_name, "arguments" => args}})
+       when is_binary(args) do
     args = Jason.decode!(args)
+    execute_tool_call(%{"function" => %{"name" => tool_name, "arguments" => args}})
+  end
+
+  defp execute_tool_call(%{"function" => %{"name" => tool_name, "arguments" => args}}) do
     execute_tool(tool_name, args, nil)
   end
 
-  def execute_tool(tool_name, args, ctx \\ nil)
+  defp execute_tool_call(other) do
+    {:error, "Malformed tool call: #{inspect(other)}"}
+  end
 
-  def execute_tool(tool_name, args, ctx) when is_binary(tool_name) do
+  defp execute_tool(tool_name, args, ctx \\ nil)
+
+  defp execute_tool(tool_name, args, ctx) when is_binary(tool_name) do
     tool_name
     |> String.replace("_", ".")
     |> List.wrap()
     |> Module.concat()
     |> Code.ensure_loaded()
     |> case do
-      {:module, module_name} ->
-        execute_tool(module_name, args, ctx)
-
-      {:error, :nofile} ->
-        {:error,
-         "Failed to load tool module #{tool_name}: It doesn't seems to be implemented or reachable"}
-
-      {:error, error} ->
-        {:error, "Failed to load tool module #{tool_name}: #{inspect(error)}"}
+      {:module, module_name} -> execute_tool(module_name, args, ctx)
+      {:error, :nofile} -> {:error, "Tool module not found: #{tool_name}"}
+      {:error, error} -> {:error, "Failed to load #{tool_name}: #{inspect(error)}"}
     end
   end
 
-  def execute_tool(module_name, args, ctx) when is_atom(module_name) do
+  defp execute_tool(module_name, args, ctx) when is_atom(module_name) do
     cond do
       Lux.prism?(module_name) -> module_name.handler(args, ctx)
-      Lux.beam?(module_name)  -> module_name.run(args, ctx)
-      true -> {:error, "Tool #{module_name} does not have a registered handler or run function"}
+      Lux.beam?(module_name) -> module_name.run(args, ctx)
+      true -> {:error, "Tool #{inspect(module_name)} has no handler/run function"}
     end
   end
 
-  defp handle_error(error, cfg) do
-    Logger.error("OpenRouter API error: #{inspect(error)}")
-
-    if cfg.retries > 0 do
-      Logger.warning("Retrying... #{cfg.retries} attempts left")
-      call("retry", [], %{cfg | retries: cfg.retries - 1})
-    else
-      {:error, "OpenRouter API error: #{inspect(error)}"}
-    end
-  end
+  # Allow registry module to be configured for testing
+  defp registry,
+    do: Application.get_env(:lux, :provider_registry_module, Lux.LLM.ProviderRegistry)
 end
